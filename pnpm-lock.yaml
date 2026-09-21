@@ -221,6 +221,10 @@ importers:
         version: 3.1.0
 
   artifacts/clip-finder:
+    dependencies:
+      realtime-bpm-analyzer:
+        specifier: ^5.0.15
+        version: 5.0.15
     devDependencies:
       '@hookform/resolvers':
         specifier: ^3.10.0
@@ -2753,6 +2757,9 @@ packages:
     resolution: {integrity: sha512-57frrGM/OCTLqLOAh0mhVA9VBMHd+9U7Zb2THMGdBUoZVOtGbJzjxsYGDJ3A9AYYCP4hn6y1TVbaOfzWtm5GFg==}
     engines: {node: '>= 12.13.0'}
 
+  realtime-bpm-analyzer@5.0.15:
+    resolution: {integrity: sha512-LyTQsTOLrGZK7SCiB3dNTDOfr0+IMA/T/YItH1b1PXedsBZu0utg82GwaaOqnWRRZfsP8HiSkcKNk1Nc2F2ZPw==}
+
   recharts-scale@0.4.5:
     resolution: {integrity: sha512-kivNFO+0OcUNu7jQquLXAxz1FIwZj8nrj+YkOKc5694NbjCvcT6aSZiIzNzd2Kul4o4rTto8QVR9lMNtxD4G1w==}
 
@@ -5254,6 +5261,8 @@ snapshots:
   readdirp@5.0.0: {}
 
   real-require@0.2.0: {}
+
+  realtime-bpm-analyzer@5.0.15: {}
 
   recharts-scale@0.4.5:
     dependencies:

@@ -21,6 +21,7 @@ import {
   Upload,
   Youtube,
 } from 'lucide-react';
+import { analyzeFullBuffer } from 'realtime-bpm-analyzer';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { ErrorBoundary } from '@/components/error-boundary';
 import { Toaster } from '@/components/ui/toaster';
@@ -32,6 +33,7 @@ type Source = {
   type: 'youtube' | 'local';
   url: string;
   label: string;
+  mediaType: 'video' | 'audio';
 };
 
 type Moment = {
@@ -58,11 +60,14 @@ declare global {
   interface Window {
     YT?: { Player: new (element: string | HTMLElement, options: Record<string, unknown>) => YouTubePlayer };
     onYouTubeIframeAPIReady?: () => void;
+    webkitAudioContext?: typeof AudioContext;
   }
 }
 
 const queryClient = new QueryClient();
 const STORAGE_KEY = 'clip-finder-moments-v1';
+const MIN_BEAT_ANALYSIS_SECONDS = 3;
+type FlashOverlayStatus = 'idle' | 'generating' | 'success' | 'error';
 
 const checklist = [
   { id: 'impact', label: 'Sudden motion or impact frame', short: 'Impact frame', key: '1' },
@@ -91,6 +96,68 @@ function parseTime(value: string) {
   return Math.max(0, parts[0] || 0);
 }
 
+function detectBeatTimestamps(buffer: AudioBuffer, bpm: number) {
+  const sampleRate = buffer.sampleRate;
+  const channelData = Array.from({ length: buffer.numberOfChannels }, (_, index) => buffer.getChannelData(index));
+  const windowSize = Math.max(256, Math.floor(sampleRate * 0.04));
+  const hopSize = Math.max(128, Math.floor(sampleRate * 0.01));
+  const envelope: Array<{ time: number; level: number }> = [];
+
+  for (let offset = 0; offset + windowSize < buffer.length; offset += hopSize) {
+    let sum = 0;
+    let sampleCount = 0;
+    for (let index = 0; index < windowSize; index += 4) {
+      let sample = 0;
+      for (const channel of channelData) sample += channel[offset + index] ?? 0;
+      sample /= Math.max(1, channelData.length);
+      sum += sample * sample;
+      sampleCount += 1;
+    }
+    envelope.push({
+      time: (offset + windowSize / 2) / sampleRate,
+      level: Math.sqrt(sum / Math.max(1, sampleCount)),
+    });
+  }
+
+  const onset = envelope.map((frame, index) => ({
+    time: frame.time,
+    strength: Math.max(0, frame.level - (envelope[index - 1]?.level ?? frame.level)),
+  }));
+  const average = onset.reduce((total, frame) => total + frame.strength, 0) / Math.max(1, onset.length);
+  const variance = onset.reduce((total, frame) => total + (frame.strength - average) ** 2, 0) / Math.max(1, onset.length);
+  const threshold = average + Math.sqrt(variance) * 0.55;
+  const interval = 60 / bpm;
+  const minGap = interval * 0.45;
+  const candidates = onset
+    .filter((frame, index) => frame.strength >= threshold && frame.strength >= (onset[index - 1]?.strength ?? 0) && frame.strength >= (onset[index + 1]?.strength ?? 0))
+    .sort((a, b) => b.strength - a.strength);
+  const selected: Array<{ time: number; strength: number }> = [];
+
+  for (const candidate of candidates) {
+    if (selected.every((frame) => Math.abs(frame.time - candidate.time) >= minGap)) {
+      selected.push(candidate);
+    }
+  }
+
+  const beatTimes = selected
+    .sort((a, b) => a.time - b.time)
+    .map((frame) => Math.round(frame.time * 1000) / 1000);
+
+  if (beatTimes.length > 0) return beatTimes;
+
+  const strongest = onset.reduce<{ time: number; strength: number } | null>(
+    (best, frame) => (!best || frame.strength > best.strength ? frame : best),
+    null,
+  );
+  if (!strongest || strongest.strength <= 0) return [];
+
+  const generated: number[] = [];
+  for (let time = strongest.time; time < buffer.duration; time += interval) {
+    if (time >= 0) generated.push(Math.round(time * 1000) / 1000);
+  }
+  return generated;
+}
+
 function getYouTubeId(value: string) {
   try {
     const url = new URL(value);
@@ -115,6 +182,7 @@ function readMoments(): Moment[] {
 function AppShell() {
   const [source, setSource] = useState<Source | null>(null);
   const [sourceTab, setSourceTab] = useState<'youtube' | 'local'>('youtube');
+  const [activeTool, setActiveTool] = useState<'clip' | 'beat'>('clip');
   const [youtubeUrl, setYoutubeUrl] = useState('');
   const [sourceError, setSourceError] = useState('');
   const [sourceLoading, setSourceLoading] = useState(false);
@@ -130,11 +198,19 @@ function AppShell() {
   const [toastVisible, setToastVisible] = useState(false);
   const [showShortcuts, setShowShortcuts] = useState(false);
   const [localFileName, setLocalFileName] = useState('');
+  const [detectedBpm, setDetectedBpm] = useState<number | null>(null);
+  const [beatTimestamps, setBeatTimestamps] = useState<number[]>([]);
+  const [beatDetectionStatus, setBeatDetectionStatus] = useState<'idle' | 'analyzing' | 'success' | 'error'>('idle');
+  const [beatError, setBeatError] = useState('');
+  const [flashOverlayStatus, setFlashOverlayStatus] = useState<FlashOverlayStatus>('idle');
+  const [flashOverlayError, setFlashOverlayError] = useState('');
   const videoRef = useRef<HTMLVideoElement>(null);
+  const audioRef = useRef<HTMLAudioElement>(null);
   const playerHostRef = useRef<HTMLDivElement>(null);
   const playerRef = useRef<YouTubePlayer | null>(null);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const objectUrlRef = useRef<string | null>(null);
+  const localFileRef = useRef<File | null>(null);
 
   const sortedMoments = useMemo(
     () => [...moments].sort((a, b) => b.tags.length - a.tags.length || a.start - b.start),
@@ -263,10 +339,174 @@ function AppShell() {
     const next = Math.max(0, Math.min(duration || Number.MAX_SAFE_INTEGER, time));
     setCurrentTime(next);
     if (source?.type === 'local' && videoRef.current) videoRef.current.currentTime = next;
+    if (source?.type === 'local' && source.mediaType === 'audio' && audioRef.current) audioRef.current.currentTime = next;
     if (source?.type === 'youtube') playerRef.current?.seekTo(next, true);
   };
 
   const seekBy = (delta: number) => seekTo(currentTime + delta);
+
+  const resetBeatDetection = () => {
+    setDetectedBpm(null);
+    setBeatTimestamps([]);
+    setBeatDetectionStatus('idle');
+    setBeatError('');
+    setFlashOverlayStatus('idle');
+    setFlashOverlayError('');
+  };
+
+  const detectBeats = async () => {
+    const file = localFileRef.current;
+    if (!file || source?.type !== 'local') {
+      setBeatDetectionStatus('error');
+      setBeatError('Beat Marker works only with a local media file. YouTube embeds do not expose audio to this tool.');
+      return;
+    }
+
+    setBeatDetectionStatus('analyzing');
+    setBeatError('');
+    setDetectedBpm(null);
+    setBeatTimestamps([]);
+
+    let audioContext: AudioContext | null = null;
+    try {
+      const AudioContextConstructor = window.AudioContext ?? window.webkitAudioContext;
+      if (!AudioContextConstructor) throw new Error('This browser does not support the Web Audio API.');
+
+      audioContext = new AudioContextConstructor();
+      const audioBuffer = await audioContext.decodeAudioData(await file.arrayBuffer());
+      if (audioBuffer.duration < MIN_BEAT_ANALYSIS_SECONDS) {
+        throw new Error(`This file is too short to analyze reliably. Use a file at least ${MIN_BEAT_ANALYSIS_SECONDS} seconds long.`);
+      }
+
+      const tempos = await analyzeFullBuffer(audioBuffer);
+      const bpm = tempos[0]?.tempo;
+      if (!bpm || !Number.isFinite(bpm)) throw new Error('No steady BPM was found in this file.');
+
+      const timestamps = detectBeatTimestamps(audioBuffer, bpm);
+      if (!timestamps.length) throw new Error('No distinct beats were found. Try a file with a clearer rhythm or stronger audio.');
+
+      setDetectedBpm(Math.round(bpm));
+      setBeatTimestamps(timestamps);
+      setBeatDetectionStatus('success');
+      announce(`Found ${timestamps.length} beats at ${Math.round(bpm)} BPM`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Beat detection failed. Try another local media file.';
+      setBeatDetectionStatus('error');
+      setBeatError(message);
+    } finally {
+      if (audioContext) await audioContext.close().catch(() => undefined);
+    }
+  };
+
+  const exportBeatCsv = () => {
+    if (!beatTimestamps.length) {
+      announce('Detect beats before exporting.');
+      return;
+    }
+    const csv = ['Timestamp', ...beatTimestamps.map((timestamp) => formatTime(timestamp, duration >= 3600))].join('\n');
+    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = 'clip-finder-beats.csv';
+    anchor.click();
+    URL.revokeObjectURL(url);
+    announce('Beat timestamps exported.');
+  };
+
+  const generateFlashOverlay = async () => {
+    if (!source || source.type !== 'local' || !duration || !beatTimestamps.length) {
+      setFlashOverlayStatus('error');
+      setFlashOverlayError('Load a local media file and detect beats before generating an overlay.');
+      return;
+    }
+
+    if (!window.MediaRecorder || !HTMLCanvasElement.prototype.captureStream) {
+      setFlashOverlayStatus('error');
+      setFlashOverlayError('This browser cannot generate a downloadable overlay video. Try a current Chrome, Edge, or Firefox browser.');
+      return;
+    }
+
+    const mimeType = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm']
+      .find((candidate) => MediaRecorder.isTypeSupported(candidate));
+    if (!mimeType) {
+      setFlashOverlayStatus('error');
+      setFlashOverlayError('This browser does not support WebM video export.');
+      return;
+    }
+
+    setFlashOverlayStatus('generating');
+    setFlashOverlayError('');
+
+    const canvas = document.createElement('canvas');
+    canvas.width = 1280;
+    canvas.height = 720;
+    const context = canvas.getContext('2d');
+    if (!context) {
+      setFlashOverlayStatus('error');
+      setFlashOverlayError('The browser could not create a canvas for the overlay.');
+      return;
+    }
+
+    const stream = canvas.captureStream(30);
+    const chunks: BlobPart[] = [];
+    const recorder = new MediaRecorder(stream, { mimeType });
+    const startedAt = performance.now();
+    const flashWindow = 0.12;
+    let animationFrame = 0;
+
+    await new Promise<void>((resolve, reject) => {
+      const cleanup = () => {
+        cancelAnimationFrame(animationFrame);
+        stream.getTracks().forEach((track) => track.stop());
+      };
+
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) chunks.push(event.data);
+      };
+      recorder.onerror = () => {
+        cleanup();
+        reject(new Error('The browser stopped recording the overlay.'));
+      };
+      recorder.onstop = () => {
+        cleanup();
+        if (!chunks.length) {
+          reject(new Error('No overlay video data was produced.'));
+          return;
+        }
+        const blob = new Blob(chunks, { type: mimeType });
+        const url = URL.createObjectURL(blob);
+        const anchor = document.createElement('a');
+        anchor.href = url;
+        anchor.download = 'clip-finder-flash-overlay.webm';
+        anchor.click();
+        URL.revokeObjectURL(url);
+        resolve();
+      };
+
+      const renderFrame = () => {
+        const elapsed = (performance.now() - startedAt) / 1000;
+        const flashing = beatTimestamps.some((timestamp) => Math.abs(timestamp - elapsed) <= flashWindow / 2);
+        context.fillStyle = flashing ? '#ffffff' : '#000000';
+        context.fillRect(0, 0, canvas.width, canvas.height);
+        if (elapsed >= duration) {
+          recorder.stop();
+          return;
+        }
+        animationFrame = requestAnimationFrame(renderFrame);
+      };
+
+      context.fillStyle = '#000000';
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      recorder.start();
+      animationFrame = requestAnimationFrame(renderFrame);
+    }).then(() => {
+      setFlashOverlayStatus('success');
+      announce('Flash overlay video downloaded.');
+    }).catch((error: unknown) => {
+      setFlashOverlayStatus('error');
+      setFlashOverlayError(error instanceof Error ? error.message : 'Flash overlay video generation failed.');
+    });
+  };
 
   const moveBetweenMoments = (direction: -1 | 1) => {
     if (!timelineMoments.length) {
@@ -304,14 +544,19 @@ function AppShell() {
 
   const togglePlayback = () => {
     if (!source) {
-      announce('Load a video to start reviewing.');
+      announce('Load media to start reviewing.');
       return;
     }
-    if (source.type === 'local' && videoRef.current) {
-      if (videoRef.current.paused) {
-        void videoRef.current.play();
+    if (source.type === 'local') {
+      const mediaElement = source.mediaType === 'audio' ? audioRef.current : videoRef.current;
+      if (mediaElement) {
+        if (mediaElement.paused) {
+          void mediaElement.play();
+        } else {
+          mediaElement.pause();
+        }
       } else {
-        videoRef.current.pause();
+        return;
       }
     } else if (source.type === 'youtube') {
       if (isPlaying) playerRef.current?.pauseVideo();
@@ -326,29 +571,32 @@ function AppShell() {
       setSourceError('Paste a full YouTube link, such as youtube.com/watch?v=...');
       return;
     }
-    setSource({ type: 'youtube', url: youtubeUrl.trim(), label: `YouTube / ${id}` });
+    setSource({ type: 'youtube', url: youtubeUrl.trim(), label: `YouTube / ${id}`, mediaType: 'video' });
     setCurrentTime(0);
     setDuration(0);
     setStartTime(0);
     setEndTime(0);
+    resetBeatDetection();
   };
 
   const loadLocal = (file?: File) => {
     if (!file) return;
-    if (!file.type.startsWith('video/')) {
-      setSourceError('That file is not a video. Choose an MP4, WebM, MOV, or another video file.');
+    if (!file.type.startsWith('video/') && !file.type.startsWith('audio/')) {
+      setSourceError('That file is not a supported video or audio file. Choose an MP4, WebM, MOV, MP3, or WAV.');
       return;
     }
     if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
     objectUrlRef.current = URL.createObjectURL(file);
+    localFileRef.current = file;
     setLocalFileName(file.name);
-    setSource({ type: 'local', url: objectUrlRef.current, label: file.name });
+    setSource({ type: 'local', url: objectUrlRef.current, label: file.name, mediaType: file.type.startsWith('audio/') ? 'audio' : 'video' });
     setSourceLoading(true);
     setSourceError('');
     setCurrentTime(0);
     setDuration(0);
     setStartTime(0);
     setEndTime(0);
+    resetBeatDetection();
   };
 
   const clearSource = () => {
@@ -356,6 +604,7 @@ function AppShell() {
     playerRef.current = null;
     if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
     objectUrlRef.current = null;
+    localFileRef.current = null;
     setSource(null);
     setLocalFileName('');
     setYoutubeUrl('');
@@ -364,6 +613,7 @@ function AppShell() {
     setDuration(0);
     setSourceLoading(false);
     setSourceError('');
+    resetBeatDetection();
   };
 
   const markStart = () => {
@@ -495,13 +745,22 @@ function AppShell() {
           </div>
         </div>
 
+        <div className="mb-5 flex w-full max-w-md rounded-xl border border-border bg-muted p-1" role="tablist" aria-label="Editor tools">
+          <button type="button" role="tab" aria-selected={activeTool === 'clip'} onClick={() => setActiveTool('clip')} className={`flex flex-1 items-center justify-center gap-2 rounded-lg px-3 py-2.5 text-xs font-bold transition ${activeTool === 'clip' ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`} data-testid="button-tool-clip-finder">
+            <Scissors size={14} /> Clip Finder
+          </button>
+          <button type="button" role="tab" aria-selected={activeTool === 'beat'} onClick={() => setActiveTool('beat')} className={`flex flex-1 items-center justify-center gap-2 rounded-lg px-3 py-2.5 text-xs font-bold transition ${activeTool === 'beat' ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`} data-testid="button-tool-beat-marker">
+            <FileVideo size={14} /> Beat Marker
+          </button>
+        </div>
+
         <section className="mb-5 rounded-2xl border border-border bg-card p-3 shadow-sm sm:p-4" aria-label="Video source">
           <div className="flex flex-col gap-3 lg:flex-row lg:items-center">
             <div className="flex shrink-0 items-center gap-2 pr-1">
               <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-secondary text-[hsl(var(--secondary-foreground))]"><Film size={16} /></div>
               <div>
                 <div className="text-xs font-bold uppercase tracking-[.08em]">Source</div>
-                <div className="font-mono text-[9px] text-muted-foreground">{source ? 'one video loaded' : 'load exactly one video'}</div>
+                 <div className="font-mono text-[9px] text-muted-foreground">{source ? 'one media file loaded' : 'load exactly one video or audio file'}</div>
               </div>
             </div>
             {source ? (
@@ -526,8 +785,8 @@ function AppShell() {
                   </form>
                 ) : (
                   <label className="flex min-h-10 flex-1 cursor-pointer items-center justify-between gap-3 rounded-lg border border-dashed border-[hsl(var(--primary)/.45)] bg-[hsl(var(--primary)/.05)] px-3 text-xs font-semibold transition hover:bg-[hsl(var(--primary)/.1)]" data-testid="label-local-upload">
-                    <span className="flex items-center gap-2"><Upload size={15} className="text-[hsl(var(--primary))]" /> {localFileName || 'Choose a video file from your device'}</span>
-                    <input type="file" accept="video/*" className="sr-only" onChange={(event) => loadLocal(event.target.files?.[0])} aria-label="Choose local video" data-testid="input-local-video" />
+                     <span className="flex items-center gap-2"><Upload size={15} className="text-[hsl(var(--primary))]" /> {localFileName || 'Choose a video or audio file from your device'}</span>
+                     <input type="file" accept="video/*,audio/*" className="sr-only" onChange={(event) => loadLocal(event.target.files?.[0])} aria-label="Choose local video or audio" data-testid="input-local-media" />
                     <span className="rounded-md bg-card px-2 py-1 font-mono text-[9px] uppercase tracking-[.1em]">Browse</span>
                   </label>
                 )}
@@ -537,7 +796,7 @@ function AppShell() {
           {sourceError && <div className="mt-3 flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive" role="alert" data-testid="status-source-error"><Info size={15} className="mt-0.5 shrink-0" /> <span>{sourceError}</span></div>}
         </section>
 
-        <div className="grid gap-5 lg:grid-cols-[minmax(0,1.35fr)_minmax(330px,.8fr)]">
+        <div className={activeTool === 'clip' ? 'grid gap-5 lg:grid-cols-[minmax(0,1.35fr)_minmax(330px,.8fr)]' : 'space-y-5'}>
           <div className="min-w-0 space-y-5">
             <section className="clip-rise clip-rise-delay-1 overflow-hidden rounded-2xl border border-foreground/10 bg-foreground shadow-lg" aria-label="Video player">
               <div className="relative aspect-video min-h-[240px] bg-[#252321]">
@@ -545,11 +804,26 @@ function AppShell() {
                   <div className="absolute inset-0 flex flex-col items-center justify-center px-6 text-center text-background">
                     <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl border border-background/20 bg-background/10"><ListVideo size={25} strokeWidth={1.5} /></div>
                     <div className="font-serif text-xl font-bold tracking-[-.03em]">Your edit bay is empty.</div>
-                    <p className="mt-2 max-w-sm text-xs leading-5 text-background/60">Paste a YouTube link or choose a local video above. Your markers stay in this browser.</p>
+                     <p className="mt-2 max-w-sm text-xs leading-5 text-background/60">Paste a YouTube link or choose a local video or audio file above. Your markers stay in this browser.</p>
                     <div className="mt-5 flex items-center gap-2 font-mono text-[9px] uppercase tracking-[.15em] text-background/45"><span>Space</span><span>play / pause</span><span className="text-background/20">·</span><span>I / O</span><span>mark range</span></div>
                   </div>
-                ) : source.type === 'local' ? (
-                  <video ref={videoRef} src={source.url} className="absolute inset-0 h-full w-full object-contain" onLoadedMetadata={(event) => { setDuration(event.currentTarget.duration); setSourceLoading(false); }} onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)} onPlay={() => setIsPlaying(true)} onPause={() => setIsPlaying(false)} onError={() => { setSourceLoading(false); setSourceError('This local video could not be decoded by your browser.'); }} controls={false} data-testid="video-local-player" />
+                 ) : source.type === 'local' ? (
+                   source.mediaType === 'audio' ? (
+                     <div className="absolute inset-0 flex items-center justify-center bg-[#252321] px-5 sm:px-10">
+                       <div className="w-full max-w-xl rounded-2xl border border-background/10 bg-[#1d1c1a] p-5 shadow-xl sm:p-7">
+                         <div className="mb-4 flex items-center justify-between gap-3">
+                           <div>
+                             <div className="font-mono text-[9px] uppercase tracking-[.16em] text-background/45">Audio / review</div>
+                             <div className="mt-1 truncate font-serif text-lg font-bold text-background">{source.label}</div>
+                           </div>
+                           <div className="rounded-lg bg-background/10 px-2.5 py-1.5 font-mono text-[9px] uppercase tracking-[.1em] text-background/55">local file</div>
+                         </div>
+                         <audio ref={audioRef} src={source.url} className="w-full" onLoadedMetadata={(event) => { setDuration(event.currentTarget.duration); setSourceLoading(false); }} onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)} onPlay={() => setIsPlaying(true)} onPause={() => setIsPlaying(false)} onEnded={() => setIsPlaying(false)} onError={() => { setSourceLoading(false); setSourceError('This local audio file could not be decoded by your browser.'); }} controls data-testid="audio-local-player" />
+                       </div>
+                     </div>
+                   ) : (
+                     <video ref={videoRef} src={source.url} className="absolute inset-0 h-full w-full object-contain" onLoadedMetadata={(event) => { setDuration(event.currentTarget.duration); setSourceLoading(false); }} onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)} onPlay={() => setIsPlaying(true)} onPause={() => setIsPlaying(false)} onEnded={() => setIsPlaying(false)} onError={() => { setSourceLoading(false); setSourceError('This local video could not be decoded by your browser.'); }} controls={false} data-testid="video-local-player" />
+                   )
                 ) : (
                   <div ref={playerHostRef} className="absolute inset-0 h-full w-full [&>iframe]:h-full [&>iframe]:w-full" data-testid="video-youtube-player" />
                 )}
@@ -559,6 +833,9 @@ function AppShell() {
               <div className="border-t border-background/10 bg-[#1d1c1a] px-4 pb-3 pt-2.5 sm:px-5">
                 <div className="relative mb-2 h-1.5 cursor-pointer rounded-full bg-background/15" onClick={(event) => { if (!duration) return; const rect = event.currentTarget.getBoundingClientRect(); seekTo(((event.clientX - rect.left) / rect.width) * duration); }} role="slider" aria-label="Video timeline" aria-valuemin={0} aria-valuemax={duration} aria-valuenow={currentTime} tabIndex={0} data-testid="slider-video-timeline">
                   <div className="h-full rounded-full bg-[hsl(var(--primary))] transition-[width] duration-100" style={{ width: `${Math.min(100, progress)}%` }} />
+                  {activeTool === 'beat' && beatTimestamps.map((timestamp, index) => (
+                    <span key={`${timestamp}-${index}`} className="pointer-events-none absolute top-1/2 z-10 h-3 w-px -translate-y-1/2 bg-[hsl(var(--accent))]" style={{ left: `${Math.min(100, Math.max(0, duration ? (timestamp / duration) * 100 : 0))}%` }} data-testid={`marker-beat-tick-${index}`} aria-hidden="true" />
+                  ))}
                   <div className="absolute top-1/2 h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-[#1d1c1a] bg-[hsl(var(--accent))] shadow" style={{ left: `${Math.min(100, progress)}%` }} />
                 </div>
                 <div className="flex items-center justify-between gap-3">
@@ -573,7 +850,8 @@ function AppShell() {
               </div>
             </section>
 
-            <section className="clip-rise clip-rise-delay-2 rounded-2xl border border-border bg-card p-4 shadow-sm sm:p-5" aria-label="Moment details">
+            {activeTool === 'clip' ? (
+              <section className="clip-rise clip-rise-delay-2 rounded-2xl border border-border bg-card p-4 shadow-sm sm:p-5" aria-label="Moment details">
               <div className="mb-4 flex items-start justify-between gap-3">
                 <div>
                   <div className="flex items-center gap-2 font-mono text-[10px] font-medium uppercase tracking-[.17em] text-muted-foreground"><span className="h-1.5 w-1.5 rounded-full bg-[hsl(var(--primary))]" /> Mark a moment</div>
@@ -603,10 +881,33 @@ function AppShell() {
                 <textarea id="clip-note" value={note} onChange={(event) => setNote(event.target.value)} rows={2} placeholder="Why should an editor come back to this?" className="w-full resize-none rounded-lg border border-input bg-background px-3 py-2 text-sm outline-none transition placeholder:text-muted-foreground focus:border-[hsl(var(--primary))]" data-testid="input-moment-note" />
               </div>
               <button type="button" onClick={logMoment} className="mt-4 flex h-11 w-full items-center justify-center gap-2 rounded-xl bg-primary text-sm font-bold text-primary-foreground shadow-sm transition hover:brightness-95 active:scale-[.99]" data-testid="button-log-moment"><Scissors size={16} /> Log this moment</button>
-            </section>
+              </section>
+            ) : (
+              <>
+                <BeatMarkerControls
+                  source={source}
+                  detectedBpm={detectedBpm}
+                  beatCount={beatTimestamps.length}
+                  status={beatDetectionStatus}
+                  error={beatError}
+                  onDetect={detectBeats}
+                  onExport={exportBeatCsv}
+                   flashOverlayStatus={flashOverlayStatus}
+                   flashOverlayError={flashOverlayError}
+                   onGenerateFlashOverlay={generateFlashOverlay}
+                />
+                <BeatMarkerList
+                  timestamps={beatTimestamps}
+                  duration={duration}
+                  bpm={detectedBpm}
+                  onJump={seekTo}
+                />
+              </>
+            )}
           </div>
 
-          <aside className="clip-rise clip-rise-delay-3 min-w-0 rounded-2xl border border-border bg-card shadow-sm lg:sticky lg:top-5 lg:self-start" aria-label="Logged moments">
+          {activeTool === 'clip' && (
+            <aside className="clip-rise clip-rise-delay-3 min-w-0 rounded-2xl border border-border bg-card shadow-sm lg:sticky lg:top-5 lg:self-start" aria-label="Logged moments">
             <div className="border-b border-border p-4 sm:p-5">
               <div className="flex items-start justify-between gap-3">
                 <div>
@@ -651,7 +952,8 @@ function AppShell() {
             <div className="border-t border-border px-4 py-3">
               <div className="flex items-center gap-2 text-[10px] leading-4 text-muted-foreground" data-testid="text-sort-description"><ChevronDown size={13} className="text-[hsl(var(--primary))]" /> Sorted by number of checked tags, then timestamp</div>
             </div>
-          </aside>
+            </aside>
+          )}
         </div>
       </main>
 
@@ -662,6 +964,133 @@ function AppShell() {
       </div>}
       <div className={`fixed bottom-5 left-1/2 z-50 flex -translate-x-1/2 items-center gap-2 rounded-full bg-foreground px-4 py-2.5 text-xs font-semibold text-background shadow-xl transition ${toastVisible ? 'translate-y-0 opacity-100' : 'pointer-events-none translate-y-3 opacity-0'}`} role="status" aria-live="polite" data-testid="status-toast"><Check size={15} className="text-[hsl(var(--accent))]" /> {toast}</div>
     </div>
+  );
+}
+
+type BeatDetectionStatus = 'idle' | 'analyzing' | 'success' | 'error';
+
+function BeatMarkerControls({
+  source,
+  detectedBpm,
+  beatCount,
+  status,
+  error,
+  onDetect,
+  onExport,
+  flashOverlayStatus,
+  flashOverlayError,
+  onGenerateFlashOverlay,
+}: {
+  source: Source | null;
+  detectedBpm: number | null;
+  beatCount: number;
+  status: BeatDetectionStatus;
+  error: string;
+  onDetect: () => Promise<void>;
+  onExport: () => void;
+  flashOverlayStatus: FlashOverlayStatus;
+  flashOverlayError: string;
+  onGenerateFlashOverlay: () => Promise<void>;
+}) {
+  const localReady = source?.type === 'local';
+  return (
+    <section className="clip-rise clip-rise-delay-2 rounded-2xl border border-border bg-card p-4 shadow-sm sm:p-5" aria-label="Beat Marker">
+      <div className="mb-4 flex items-start justify-between gap-3">
+        <div>
+          <div className="flex items-center gap-2 font-mono text-[10px] font-medium uppercase tracking-[.17em] text-muted-foreground"><span className="h-1.5 w-1.5 rounded-full bg-[hsl(var(--primary))]" /> Beat Marker</div>
+          <h2 className="mt-1 font-serif text-xl font-bold tracking-[-.035em]">Find the pulse in your footage.</h2>
+        </div>
+        <div className="rounded-lg bg-foreground px-3 py-2 text-right text-background" data-testid="status-detected-bpm">
+          <div className="font-serif text-xl font-bold leading-none">{detectedBpm ?? '—'}</div>
+          <div className="mt-1 font-mono text-[9px] uppercase tracking-[.12em] text-background/60">BPM</div>
+        </div>
+      </div>
+
+      <div className="rounded-xl border border-[hsl(var(--secondary-foreground)/.12)] bg-secondary/60 p-3 text-xs leading-5 text-secondary-foreground" data-testid="text-beat-marker-note">
+        Beat Marker runs entirely in your browser with Web Audio. It is available for local files only because YouTube embeds block the audio access this needs.
+      </div>
+
+      {status === 'error' && (
+        <div className="mt-3 flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs leading-5 text-destructive" role="alert" data-testid="status-beat-error">
+          <Info size={15} className="mt-0.5 shrink-0" /> <span>{error}</span>
+        </div>
+      )}
+
+      <div className="mt-4 flex flex-col gap-2 sm:flex-row">
+        <button type="button" onClick={() => void onDetect()} disabled={!localReady || status === 'analyzing'} className="inline-flex h-11 flex-1 items-center justify-center gap-2 rounded-xl bg-primary px-4 text-sm font-bold text-primary-foreground shadow-sm transition hover:brightness-95 active:scale-[.99] disabled:cursor-not-allowed disabled:opacity-45" data-testid="button-detect-beats">
+           <FileVideo size={16} /> {status === 'analyzing' ? 'Detecting beats…' : 'Detect beats'}
+        </button>
+        <button type="button" onClick={onExport} disabled={!beatCount} className="inline-flex h-11 items-center justify-center gap-2 rounded-xl border border-border bg-background px-4 text-sm font-bold transition hover:bg-muted disabled:cursor-not-allowed disabled:opacity-45" data-testid="button-export-beats">
+          <Download size={16} /> Export CSV
+        </button>
+      </div>
+
+      <button type="button" onClick={() => void onGenerateFlashOverlay()} disabled={!localReady || !beatCount || flashOverlayStatus === 'generating'} className="mt-2 inline-flex h-11 w-full items-center justify-center gap-2 rounded-xl border border-[hsl(var(--accent)/.65)] bg-[hsl(var(--accent)/.18)] px-4 text-sm font-bold transition hover:bg-[hsl(var(--accent)/.28)] disabled:cursor-not-allowed disabled:opacity-45" data-testid="button-generate-flash-overlay">
+        <Film size={16} /> {flashOverlayStatus === 'generating' ? 'Generating overlay…' : 'Generate Flash Overlay Video'}
+      </button>
+      {flashOverlayStatus === 'error' && (
+        <div className="mt-3 flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs leading-5 text-destructive" role="alert" data-testid="status-flash-overlay-error">
+          <Info size={15} className="mt-0.5 shrink-0" /> <span>{flashOverlayError}</span>
+        </div>
+      )}
+      {flashOverlayStatus === 'success' && <div className="mt-3 text-[10px] font-mono uppercase tracking-[.1em] text-[hsl(var(--chart-4))]" data-testid="status-flash-overlay-success">Flash overlay video downloaded as WebM.</div>}
+
+      {!source && <div className="mt-3 text-[10px] font-mono uppercase tracking-[.1em] text-muted-foreground" data-testid="status-beat-source">Load a local video or audio file to enable beat detection.</div>}
+      {source?.type === 'youtube' && <div className="mt-3 text-[10px] font-mono uppercase tracking-[.1em] text-muted-foreground" data-testid="status-beat-source">Switch to a local file to enable beat detection.</div>}
+      {source?.type === 'local' && source.mediaType === 'audio' && <div className="mt-3 text-[10px] font-mono uppercase tracking-[.1em] text-muted-foreground" data-testid="status-beat-source">Audio-only source loaded. Beat detection and overlay export are ready.</div>}
+      {status === 'success' && <div className="mt-3 text-[10px] font-mono uppercase tracking-[.1em] text-muted-foreground" data-testid="status-beat-summary">{beatCount} beats detected with millisecond timestamps.</div>}
+    </section>
+  );
+}
+
+function BeatMarkerList({
+  timestamps,
+  duration,
+  bpm,
+  onJump,
+}: {
+  timestamps: number[];
+  duration: number;
+  bpm: number | null;
+  onJump: (time: number) => void;
+}) {
+  return (
+    <section className="clip-rise clip-rise-delay-3 min-w-0 rounded-2xl border border-border bg-card shadow-sm" aria-label="Detected beats">
+      <div className="border-b border-border p-4 sm:p-5">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <div className="flex items-center gap-2 font-mono text-[10px] font-medium uppercase tracking-[.17em] text-muted-foreground"><ListVideo size={13} /> Beat map</div>
+            <h2 className="mt-1 font-serif text-xl font-bold tracking-[-.035em]" data-testid="text-beats-heading">Detected beats</h2>
+          </div>
+          <div className="flex h-9 min-w-9 items-center justify-center rounded-lg bg-foreground px-2 font-mono text-xs font-medium text-background" data-testid="text-beat-count">{timestamps.length}</div>
+        </div>
+        <div className="mt-3 flex items-center justify-between gap-3 text-[10px] font-mono uppercase tracking-[.1em] text-muted-foreground">
+          <span data-testid="text-beat-bpm">{bpm ? `${bpm} BPM` : 'No BPM yet'}</span>
+          <span>Click a beat to jump</span>
+        </div>
+      </div>
+      <div className="clip-scrollbar max-h-[calc(100vh-245px)] overflow-y-auto p-3 sm:p-4">
+        {!timestamps.length ? (
+          <div className="flex min-h-[310px] flex-col items-center justify-center rounded-xl border border-dashed border-border bg-background px-6 text-center" data-testid="empty-beats-state">
+            <div className="mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-muted text-muted-foreground"><FileVideo size={20} /></div>
+            <div className="font-serif text-lg font-bold tracking-[-.03em]">No beats detected</div>
+            <p className="mt-2 max-w-[230px] text-xs leading-5 text-muted-foreground">Load a local video or audio file, then run detection to build a beat map.</p>
+          </div>
+        ) : (
+          <div className="space-y-2" data-testid="list-beats">
+            {timestamps.map((timestamp, index) => (
+              <button type="button" key={`${timestamp}-${index}`} onClick={() => onJump(timestamp)} className="group flex w-full items-center gap-3 rounded-xl border border-border bg-background p-3 text-left transition hover:border-foreground/25 hover:shadow-sm" data-testid={`button-jump-beat-${index}`} aria-label={`Jump to beat ${formatTime(timestamp, duration >= 3600)}`}>
+                <span className="flex shrink-0 items-center gap-2 rounded-md bg-[hsl(var(--accent)/.45)] px-2 py-1.5 font-mono text-sm font-medium tabular-nums text-foreground transition group-hover:bg-[hsl(var(--accent))]"><Play size={11} fill="currentColor" /> {formatTime(timestamp, duration >= 3600)}</span>
+                <span className="min-w-0 flex-1 pt-0.5 text-[10px] font-mono uppercase tracking-[.1em] text-muted-foreground">Beat {String(index + 1).padStart(2, '0')}</span>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+      <div className="border-t border-border px-4 py-3">
+        <div className="flex items-center gap-2 text-[10px] leading-4 text-muted-foreground" data-testid="text-beat-sort-description"><ChevronDown size={13} className="text-[hsl(var(--primary))]" /> Millisecond-precision timestamps</div>
+      </div>
+    </section>
   );
 }
 
