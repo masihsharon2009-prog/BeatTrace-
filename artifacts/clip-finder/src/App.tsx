@@ -1,4 +1,4 @@
-import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
+import { type ChangeEvent, type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Check,
   ChevronDown,
@@ -589,6 +589,7 @@ function AppShell() {
     objectUrlRef.current = URL.createObjectURL(file);
     localFileRef.current = file;
     setLocalFileName(file.name);
+    setSourceTab('local');
     setSource({ type: 'local', url: objectUrlRef.current, label: file.name, mediaType: file.type.startsWith('audio/') ? 'audio' : 'video' });
     setSourceLoading(true);
     setSourceError('');
@@ -597,6 +598,12 @@ function AppShell() {
     setStartTime(0);
     setEndTime(0);
     resetBeatDetection();
+  };
+
+  const handleLocalFileChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.currentTarget.files?.[0];
+    event.currentTarget.value = '';
+    if (file) loadLocal(file);
   };
 
   const clearSource = () => {
@@ -784,11 +791,13 @@ function AppShell() {
                     <button type="submit" className="inline-flex shrink-0 items-center gap-2 rounded-lg bg-primary px-3.5 text-xs font-bold text-primary-foreground shadow-sm transition hover:brightness-95 active:scale-[.98]" data-testid="button-load-youtube"><Link2 size={14} /> <span className="hidden sm:inline">Load video</span><span className="sm:hidden">Load</span></button>
                   </form>
                 ) : (
-                  <label className="flex min-h-10 flex-1 cursor-pointer items-center justify-between gap-3 rounded-lg border border-dashed border-[hsl(var(--primary)/.45)] bg-[hsl(var(--primary)/.05)] px-3 text-xs font-semibold transition hover:bg-[hsl(var(--primary)/.1)]" data-testid="label-local-upload">
-                     <span className="flex items-center gap-2"><Upload size={15} className="text-[hsl(var(--primary))]" /> {localFileName || 'Choose a video or audio file from your device'}</span>
-                     <input type="file" accept="video/*,audio/*" className="sr-only" onChange={(event) => loadLocal(event.target.files?.[0])} aria-label="Choose local video or audio" data-testid="input-local-media" />
-                    <span className="rounded-md bg-card px-2 py-1 font-mono text-[9px] uppercase tracking-[.1em]">Browse</span>
-                  </label>
+                   <div className="flex min-h-10 flex-1 items-center justify-between gap-3 rounded-lg border border-dashed border-[hsl(var(--primary)/.45)] bg-[hsl(var(--primary)/.05)] px-3 text-xs font-semibold transition hover:bg-[hsl(var(--primary)/.1)]" data-testid="label-local-upload">
+                     <label htmlFor="local-media-input" className="flex min-w-0 flex-1 cursor-pointer items-center gap-2">
+                       <Upload size={15} className="shrink-0 text-[hsl(var(--primary))]" /> <span className="truncate">{localFileName || 'Choose a video or audio file from your device'}</span>
+                     </label>
+                     <input id="local-media-input" type="file" accept="video/*,audio/*" className="sr-only" onChange={handleLocalFileChange} aria-label="Choose local video or audio" data-testid="input-local-media" />
+                     <label htmlFor="local-media-input" className="shrink-0 cursor-pointer rounded-md bg-card px-2 py-1 font-mono text-[9px] uppercase tracking-[.1em]">Browse</label>
+                   </div>
                 )}
               </div>
             )}
