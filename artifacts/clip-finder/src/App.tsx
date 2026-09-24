@@ -731,6 +731,10 @@ function AppShell() {
       </header>
 
       <main className="mx-auto max-w-[1480px] px-4 py-5 sm:px-6 sm:py-8 lg:px-8">
+        <section className="mb-6 rounded-2xl border border-border bg-card p-4 shadow-sm sm:p-5" aria-labelledby="beat-marker-editor-guide">
+          <h2 id="beat-marker-editor-guide" className="font-serif text-xl font-bold tracking-[-.035em]">Beat Marker for editors without plugins</h2>
+          <p className="mt-2 max-w-4xl text-sm leading-6 text-muted-foreground">Many editing apps, like CapCut and Blurrr, have no plugin support and can't import marker files. Beat Marker finds the beats in your song and generates a black video with a white flash on every beat. Drop it on your timeline as an overlay, set its blend mode to Screen, and tap your app's own marker button at each flash. Then delete the overlay. That gives you real beat markers in any editor.</p>
+        </section>
         <div className="mb-6 flex flex-col justify-between gap-4 sm:mb-8 sm:flex-row sm:items-end">
           <div className="clip-rise">
             <div className="mb-2 flex items-center gap-2 font-mono text-[10px] font-medium uppercase tracking-[.2em] text-[hsl(var(--primary))]">
