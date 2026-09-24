@@ -182,7 +182,7 @@ function readMoments(): Moment[] {
 function AppShell() {
   const [source, setSource] = useState<Source | null>(null);
   const [sourceTab, setSourceTab] = useState<'youtube' | 'local'>('youtube');
-  const [activeTool, setActiveTool] = useState<'clip' | 'beat'>('clip');
+  const [activeTool, setActiveTool] = useState<'clip' | 'beat'>('beat');
   const [youtubeUrl, setYoutubeUrl] = useState('');
   const [sourceError, setSourceError] = useState('');
   const [sourceLoading, setSourceLoading] = useState(false);
@@ -753,11 +753,11 @@ function AppShell() {
         </div>
 
         <div className="mb-5 flex w-full max-w-md rounded-xl border border-border bg-muted p-1" role="tablist" aria-label="Editor tools">
-          <button type="button" role="tab" aria-selected={activeTool === 'clip'} onClick={() => setActiveTool('clip')} className={`flex flex-1 items-center justify-center gap-2 rounded-lg px-3 py-2.5 text-xs font-bold transition ${activeTool === 'clip' ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`} data-testid="button-tool-clip-finder">
-            <Scissors size={14} /> Clip Finder
-          </button>
           <button type="button" role="tab" aria-selected={activeTool === 'beat'} onClick={() => setActiveTool('beat')} className={`flex flex-1 items-center justify-center gap-2 rounded-lg px-3 py-2.5 text-xs font-bold transition ${activeTool === 'beat' ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`} data-testid="button-tool-beat-marker">
             <FileVideo size={14} /> Beat Marker
+          </button>
+          <button type="button" role="tab" aria-selected={activeTool === 'clip'} onClick={() => setActiveTool('clip')} className={`flex flex-1 items-center justify-center gap-2 rounded-lg px-3 py-2.5 text-xs font-bold transition ${activeTool === 'clip' ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`} data-testid="button-tool-clip-finder">
+            <Scissors size={14} /> Clip Finder
           </button>
         </div>
 
