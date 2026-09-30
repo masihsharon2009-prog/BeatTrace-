@@ -713,7 +713,7 @@ function AppShell() {
               <Scissors size={19} strokeWidth={2.3} />
             </div>
             <div>
-              <div className="font-serif text-[18px] font-bold tracking-[-.04em]" data-testid="text-brand">Clip Finder</div>
+              <div className="font-serif text-[18px] font-bold tracking-[-.04em]" data-testid="text-brand">BeatTrace</div>
               <div className="font-mono text-[9px] uppercase tracking-[.16em] text-muted-foreground">footage review desk</div>
             </div>
           </div>
