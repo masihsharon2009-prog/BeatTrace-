@@ -7,8 +7,8 @@ including CapCut and Blurrr, which don't support marker imports natively
 at all. Alongside it, Clip Finder helps you tag your best footage moments 
 without scrubbing back and forth twice.
 
-[Try it live →](YOUR-REPLIT-DEMO-LINK-HERE)
-
+[Try it live →]
+https://beat-trace--Regien0araraka.replit.app
 ## Features
 - **Beat Marker** — auto-detects BPM and beat timestamps from any local 
   audio or video file, then generates a downloadable flash-overlay video 
