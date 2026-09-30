@@ -1,4 +1,4 @@
-# editor-toolkit
+# BeatTrace 
 
 Built for video editors who cut to the beat. Beat Marker automatically 
 detects the beat of your music, then — using a flash-overlay trick — lets 
