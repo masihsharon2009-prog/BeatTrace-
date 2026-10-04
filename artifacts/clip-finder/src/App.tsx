@@ -710,7 +710,12 @@ function AppShell() {
         <div className="mx-auto flex min-h-[72px] max-w-[1480px] items-center justify-between gap-4 px-4 py-3 sm:px-6 lg:px-8">
           <div className="flex items-center gap-3">
             <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-foreground text-background shadow-sm" data-testid="brand-mark">
-              <Scissors size={19} strokeWidth={2.3} />
+              <img
+                src={`${import.meta.env.BASE_URL}beattrace-logo-mark.png`}
+                alt="BeatTrace logo"
+                className="h-full w-full rounded-xl object-cover"
+                data-testid="brand-logo"
+              />
             </div>
             <div>
               <div className="font-serif text-[18px] font-bold tracking-[-.04em]" data-testid="text-brand">BeatTrace</div>
